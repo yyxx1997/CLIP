@@ -1,6 +1,7 @@
-train_file:  '/data1/yx/suda/image-text/data/ALBEF/datas/data/coco_train.json'
-val_file: '/data1/yx/suda/image-text/data/ALBEF/datas/data/coco_val.json'                
-test_file: '/data1/yx/suda/image-text/data/ALBEF/datas/data/coco_test.json'
+train_file:  '/data1/yx/suda/image-text/data/ALBEF/datas/data/flickr30k_train.json'
+val_file: '/data1/yx/suda/image-text/data/ALBEF/datas/data/flickr30k_val.json'                
+test_file: '/data1/yx/suda/image-text/data/ALBEF/datas/data/flickr30k_test.json'
+entail_file: '/data1/yx/suda/image-text/data/ALBEF/datas/data/after_vete.json'
 image_root: '/data1/yx/suda/image-text/data/coco2014'
 
 batch_size_train: 192

@@ -1,6 +1,6 @@
-train_file:  '/data1/yx/suda/image-text/data/ALBEF/datas/data/coco_train.json'
-val_file: '/data1/yx/suda/image-text/data/ALBEF/datas/data/coco_val.json'                
-test_file: '/data1/yx/suda/image-text/data/ALBEF/datas/data/coco_test.json'
+train_file:  '/data1/yx/suda/image-text/data/ALBEF/datas/data/flickr30k_rebuild_train.json'
+val_file: '/data1/yx/suda/image-text/data/ALBEF/datas/data/flickr30k_rebuild_val.json'                
+test_file: '/data1/yx/suda/image-text/data/annotations/format_annotation_re.json'
 image_root: '/data1/yx/suda/image-text/data/coco2014'
 
 batch_size_train: 192

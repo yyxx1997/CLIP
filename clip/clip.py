@@ -122,7 +122,7 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
         model_path = name
     else:
         raise RuntimeError(f"Model {name} not found; available models = {available_models()}")
-
+    loaded = True
     with open(model_path, 'rb') as opened_file:
         try:
             # loading JIT archive
@@ -130,10 +130,14 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
             state_dict = None
         except RuntimeError:
             # loading saved state dict
+            loaded = False
             if jit:
                 warnings.warn(f"File {model_path} is not a JIT archive. Loading as a state dict instead")
                 jit = False
-            state_dict = torch.load(opened_file, map_location="cpu")
+    
+    if not loaded:
+        checkpoint = torch.load(model_path, map_location="cpu")
+        state_dict = checkpoint['state_dict']
 
     if not jit:
         model = build_model(state_dict or model.state_dict()).to(device)

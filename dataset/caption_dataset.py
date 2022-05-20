@@ -24,7 +24,8 @@ class re_train_dataset(Dataset):
         image = Image.open(image_path).convert('RGB')   
         image = self.transform(image)
         caption = ann['caption']
-        return image, caption
+        extra_info = (ann['image'],caption)
+        return image, caption, extra_info
     
     
 
@@ -69,7 +70,25 @@ class re_eval_dataset(Dataset):
 
         return image, index
       
+class re_random_dataset(Dataset):
+    def __init__(self, ann_file, transform, image_root, max_words=30):        
+        self.ann = json.load(open(ann_file,'r'))
+        self.transform = transform
+        self.image_root = image_root
+        self.max_words = max_words
         
+    def __len__(self):
+        return len(self.ann)
+    
+    def __getitem__(self, index):    
+        
+        ann = random.sample(self.ann,1)[0]
+        
+        image_path = os.path.join(self.image_root,ann['image'])        
+        image = Image.open(image_path).convert('RGB')   
+        image = self.transform(image)
+        caption = ann['caption']
+        return image, caption
             
 
     

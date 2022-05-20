@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 import torch.distributed as dist
 from transformers import BertTokenizer
+from dataset.utils import pre_caption
 import utils
 from dataset import create_dataset, create_sampler, create_loader
 from scheduler import create_scheduler
@@ -21,6 +22,17 @@ from tqdm import tqdm
 from contextlib import nullcontext
 import torch.optim as optim
 # from torch.utils.tensorboard import SummaryWriter
+
+# def contrastive_loss(logits, dim):
+#     neg_ce = torch.diag(F.log_softmax(logits, dim=dim))
+#     #import pdb; pdb.set_trace()
+#     return -neg_ce.mean()
+    
+# def clip_loss(similarity: torch.Tensor) -> torch.Tensor:
+#     #import pdb; pdb.set_trace()
+#     image_loss = contrastive_loss(similarity, dim=1)
+#     caption_loss = contrastive_loss(similarity, dim=0)
+#     return (image_loss + caption_loss) / 2.0
 
 # contrastive loss function, adapted from
 # https://sachinruk.github.io/blog/pytorch/pytorch%20lightning/loss%20function/gpu/2021/03/07/CLIP.html
@@ -33,43 +45,77 @@ def clip_loss(similarity: torch.Tensor) -> torch.Tensor:
     image_loss = contrastive_loss(similarity.T)
     return (caption_loss + image_loss) / 2.0
 
-def train(model, data_loader, optimizer, epoch, warmup_steps, device, scheduler, config):
+def entail_check(images, texts, raw_entailments, max_words=512):
+    assert len(images) == len(texts)
+    result = []
+    i = j = 0
+    for i in range(len(images)):
+        image = images[i]
+        if image not in raw_entailments.keys():
+            continue
+        entails = raw_entailments[image]
+        goldens = [pre_caption(t, max_words) for t in entails['goldens']]
+        entailments = [pre_caption(t, max_words)
+                       for t in entails['entailments']]
+        for j in range(len(texts)):
+            if i==j : continue
+            text = texts[j]
+            text = pre_caption(text, max_words)
+            if text in goldens+entailments:
+                result.append((i, j))
+    return result
+
+
+def train(model, data_loader, optimizer, epoch, warmup_steps, device, scheduler, config, random_texts, raw_entailments):
     # train
-    model.train()  
+    model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
-    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.8f}'))
-    metric_logger.add_meter('loss_itm', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    metric_logger.add_meter('lr', utils.SmoothedValue(
+        window_size=1, fmt='{value:.8f}'))
+    metric_logger.add_meter('loss_itm', utils.SmoothedValue(
+        window_size=1, fmt='{value:.6f}'))
+    metric_logger.add_meter('conflict', utils.SmoothedValue(
+        window_size=1, fmt='{value:.6f}'))
     header = 'Train Epoch: [{}]'.format(epoch)
     print_freq = 50
     step_size = 100
-    warmup_iterations = warmup_steps*step_size  
+    warmup_iterations = warmup_steps*step_size
     K = config.gradient_accumulation_steps
-    my_context = model.no_sync if config.local_rank != -1 and i % K != 0 else nullcontext
-
+    my_context = model.no_sync if config.local_rank != - \
+        1 and i % K != 0 else nullcontext
+    total = entail = 0
     optimizer.zero_grad()
-    for i,(image, text, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        image_input = image.to(device,non_blocking=True)   
-        text_input = clip.tokenize(text,truncate=True).to(device)  
+    for i, (image, text, extra_info) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        checked = entail_check(extra_info[0], extra_info[1], raw_entailments)
+        if checked:
+            entail += len(checked)
+            for image_id, text_id in checked:
+                image_, text_ = random_texts.__getitem__(1)
+                image[image_id] = image_
+                text[text_id] = text_
+        total += len(text)
+        image_input = image.to(device,non_blocking=True)
+        text_input = clip.tokenize(text,truncate=True).to(device)
 
         with my_context():
-            logits_per_image, _ = model(image_input,text_input)   
-            loss_itm = clip_loss(logits_per_image)               
+            logits_per_image, _ = model(image_input,text_input)
+            loss_itm = clip_loss(logits_per_image)
             loss_itm = loss_itm / K
             loss_itm.backward()  # 积累梯度，不应用梯度改变
         if (i+1) % K == 0:
             # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=20, norm_type=2)
             optimizer.step()
-            optimizer.zero_grad()   
-        
-        metric_logger.update(loss_itm=loss_itm.item())
+            optimizer.zero_grad()
+
+        metric_logger.update(loss_itm=loss_itm)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-        if epoch==0 and i%step_size==0 and i<=warmup_iterations: 
-            scheduler.step(i//step_size)         
-        
+        metric_logger.update(conflict=entail/total)
+        if epoch == 0 and i % step_size == 0 and i <= warmup_iterations:
+            scheduler.step(i//step_size)
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger.global_avg())     
-    return {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()} 
+    print("Averaged stats:", metric_logger.global_avg())
+    return {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}
 
 
 """
@@ -98,7 +144,6 @@ def evaluation(model, data_loader, device, config):
     header = 'Evaluation:'    
     print('Computing features for evaluation...')
     print_freq = 50
-    start_time = time.time()  
 
     texts = data_loader.dataset.text
     images = data_loader.dataset.image
@@ -238,8 +283,8 @@ def main(config):
 
     #### Dataset #### 
     print("Creating dataset")
-    train_dataset, val_dataset, test_dataset = create_dataset('re', preprocess, config)  
-
+    train_dataset, val_dataset, test_dataset, random_texts = create_dataset('re_entail', preprocess, config)  
+    raw_entailments=json.load(open(config['entail_file'],'r'))
     if config.distributed:
         num_tasks = utils.get_world_size()
         global_rank = utils.get_rank()            
@@ -289,7 +334,7 @@ def main(config):
     for epoch in range(0, max_epoch):
         if config.distributed:
             train_loader.sampler.set_epoch(epoch)
-        train_stats = train(model, train_loader, optimizer, epoch, warmup_steps, device, lr_scheduler, config)  
+        train_stats = train(model, train_loader, optimizer, epoch, warmup_steps, device, lr_scheduler, config, random_texts, raw_entailments)  
             
         val_result,val_topk = evaluation(model_without_ddp, val_loader, device, config)
         test_result,test_topk = evaluation(model_without_ddp, test_loader, device, config)
