@@ -17,6 +17,16 @@ def create_dataset(dataset, preprocess, config):
         test_dataset = re_eval_dataset(config['test_file'], preprocess, config['image_root'])    
         random_texts = re_random_dataset(config['train_file'], preprocess, config['image_root'])            
         return train_dataset, val_dataset, test_dataset,random_texts
+    elif dataset=='re_entail_lr':          
+        train_dataset = re_entail_lr_train_dataset(config['train_file'], preprocess, config['image_root'])
+        val_dataset = re_eval_dataset(config['val_file'], preprocess, config['image_root'])  
+        test_dataset = re_eval_dataset(config['test_file'], preprocess, config['image_root'])                
+        return train_dataset, val_dataset, test_dataset 
+    elif dataset=='re_entail_lr_split':          
+        train_dataset = re_entail_lr_split_train_dataset(config['train_file'], config['entailments'], preprocess, config['image_root'])
+        val_dataset = re_eval_dataset(config['val_file'], preprocess, config['image_root'])  
+        test_dataset = re_eval_dataset(config['test_file'], preprocess, config['image_root'])                
+        return train_dataset, val_dataset, test_dataset 
 
 
 def create_sampler(datasets, shuffles, num_tasks, global_rank):

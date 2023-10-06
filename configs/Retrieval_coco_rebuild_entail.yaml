@@ -1,0 +1,20 @@
+train_file:  '/data1/yx/suda/image-text/data/re_rebuild_data/coco_rebuild_train_plus_entail.json'
+val_file: '/data1/yx/suda/image-text/data/re_rebuild_data/coco_5k_test.json'                
+test_file: '/data1/yx/suda/image-text/data/annotations/format_annotation_re_coco.json'
+image_root: '/data1/yx/suda/image-text/data/images'
+
+batch_size_train: 192
+batch_size_test: 256
+k_test: 128
+warm_up: True
+
+optimizer: {opt: adamW, lr: 1e-5, weight_decay: 0.02}
+schedular: {sched: cosine, lr: 1e-5, epochs: 10, min_lr: 1e-7, decay_rate: 1, warmup_lr: 1e-5, warmup_epochs: 1, cooldown_epochs: 0}
+# '/data1/yx/suda/image-text/sotas/CLIP/output/common/re_train_samlltest.json'
+
+
+
+
+
+
+

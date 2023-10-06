@@ -14,49 +14,87 @@ from dataset import create_dataset, create_sampler, create_loader
 from scheduler import create_scheduler
 from optim import create_optimizer
 import clip
+from tqdm import tqdm
 from contextlib import nullcontext
+import torch.optim as optim
 # from torch.utils.tensorboard import SummaryWriter
 
+# def contrastive_loss(logits, dim):
+#     neg_ce = torch.diag(F.log_softmax(logits, dim=dim))
+#     #import pdb; pdb.set_trace()
+#     return -neg_ce.mean()
+    
+# def clip_loss(similarity: torch.Tensor) -> torch.Tensor:
+#     #import pdb; pdb.set_trace()
+#     image_loss = contrastive_loss(similarity, dim=1)
+#     caption_loss = contrastive_loss(similarity, dim=0)
+#     return (image_loss + caption_loss) / 2.0
+
+# contrastive loss function, adapted from
+# https://sachinruk.github.io/blog/pytorch/pytorch%20lightning/loss%20function/gpu/2021/03/07/CLIP.html
+def contrastive_loss(logits: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.cross_entropy(logits, torch.arange(len(logits), device=logits.device))
+
+
+def clip_loss(similarity: torch.Tensor) -> torch.Tensor:
+    caption_loss = contrastive_loss(similarity)
+    image_loss = contrastive_loss(similarity.T)
+    return (caption_loss + image_loss) / 2.0
+
+def modi_opt(optimizer, decay_rate):
+    for param_group in optimizer.param_groups:
+        param_group['lr'] *= decay_rate
+
+def restore_opt(optimizer, origin_lr):
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = origin_lr
 
 def train(model, data_loader, optimizer, epoch, warmup_steps, device, scheduler, config):
     # train
-    model.train()  
+    model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
-    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.8f}'))
-    metric_logger.add_meter('loss_itm', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    metric_logger.add_meter('loss_mgrc', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    metric_logger.add_meter('lr', utils.SmoothedValue(
+        window_size=1, fmt='{value:.8f}'))
+    metric_logger.add_meter('loss_itm', utils.SmoothedValue(
+        window_size=1, fmt='{value:.6f}'))
     header = 'Train Epoch: [{}]'.format(epoch)
     print_freq = 50
     step_size = 100
-    warmup_iterations = warmup_steps*step_size  
-    K = config.gradient_accumulation_steps
-    my_context = model.no_sync if config.local_rank != -1 and i % K != 0 else nullcontext
+    warmup_iterations = warmup_steps*step_size
+    lr_decay = config['lowlr']
 
     optimizer.zero_grad()
-    for i,(image, text, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        image_input = image.to(device,non_blocking=True)   
-        text_input = clip.tokenize(text,truncate=True).to(device)  
+    for i, (image, text, extra_entail) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        image_input = image.to(device,non_blocking=True)
+        text_input = clip.tokenize(text,truncate=True).to(device)
+        image_input_entail = image_input
+        text_input_entail = clip.tokenize(extra_entail,truncate=True).to(device)
 
-        with my_context():
-            loss_itm, loss_mgrc = model(image_input,text_input)      
-            loss = loss_itm + loss_mgrc         
-            loss = loss / K
-            loss.backward()  # 积累梯度，不应用梯度改变
-        if (i+1) % K == 0:
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=20, norm_type=2)
-            optimizer.step()
-            optimizer.zero_grad()   
+        logits_per_image_origin, _ = model(image_input,text_input)
+        loss_itm_origin = clip_loss(logits_per_image_origin)
+        loss_itm_origin.backward()  # 积累梯度，不应用梯度改变
+        optimizer.step()
+        optimizer.zero_grad()
+
+
+        logits_per_image_entail, _ = model(image_input_entail,text_input_entail)
+        loss_itm_entail = clip_loss(logits_per_image_entail)
+        loss_itm_entail.backward()  # 积累梯度，不应用梯度改变
         
-        metric_logger.update(loss_itm=loss_itm.item())
-        metric_logger.update(loss_mgrc=loss_mgrc.item())
+        origin_lr = optimizer.param_groups[0]['lr']
+        modi_opt(optimizer,lr_decay)
+        optimizer.step()
+        optimizer.zero_grad()
+
+        metric_logger.update(loss_itm=loss_itm_origin+loss_itm_entail)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-        if epoch==0 and i%step_size==0 and i<=warmup_iterations: 
-            scheduler.step(i//step_size)         
-        
+        restore_opt(optimizer,origin_lr)
+        if epoch == 0 and i % step_size == 0 and i <= warmup_iterations:
+            scheduler.step(i//step_size)
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger.global_avg())     
-    return {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()} 
+    print("Averaged stats:", metric_logger.global_avg())
+    return {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}
 
 
 """
@@ -85,7 +123,6 @@ def evaluation(model, data_loader, device, config):
     header = 'Evaluation:'    
     print('Computing features for evaluation...')
     print_freq = 50
-    start_time = time.time()  
 
     texts = data_loader.dataset.text
     images = data_loader.dataset.image
@@ -225,7 +262,7 @@ def main(config):
 
     #### Dataset #### 
     print("Creating dataset")
-    train_dataset, val_dataset, test_dataset = create_dataset('re', preprocess, config)  
+    train_dataset, val_dataset, test_dataset = create_dataset('re_entail_lr_split', preprocess, config)  
 
     if config.distributed:
         num_tasks = utils.get_world_size()
@@ -262,11 +299,7 @@ def main(config):
                             }
                 with open(os.path.join(config.output_dir, "log.txt"),"a") as f:
                     f.write(json.dumps(config) + "\n") 
-                    f.write(json.dumps(log_stats) + "\n")    
-                with open(os.path.join(args.output_dir, "top{}_val_result.json".format(config['k_test'])), "w") as f:
-                    f.write(json.dumps(val_topk,ensure_ascii=False,indent=4)) 
-                with open(os.path.join(args.output_dir, "top{}_test_result.json".format(config['k_test'])), "w") as f:
-                    f.write(json.dumps(test_topk,ensure_ascii=False,indent=4)) 
+                    f.write(json.dumps(log_stats) + "\n")     
             return
     
     print("Start training")
@@ -342,6 +375,7 @@ def parse_args():
     parser.add_argument('--gradient_accumulation_steps', default=1, type=int, help='gradient accumulation for increase batch virtually.')
     parser.add_argument('--local_rank', default=-1, type=int, help='device number of current process.')
     parser.add_argument('--eval_before_train', action='store_true')
+    parser.add_argument('--lowlr', default=0.3, type=float)
     args = parser.parse_args()
     return args
             

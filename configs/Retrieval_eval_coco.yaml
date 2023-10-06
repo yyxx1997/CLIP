@@ -1,10 +1,10 @@
 train_file:  '/data1/yx/suda/image-text/data/ALBEF/datas/data/coco_train.json'
-val_file: '/data1/yx/suda/image-text/data/ALBEF/datas/data/coco_val.json'                
+val_file: '/data1/yx/suda/image-text/data/annotations/format_annotation_re_coco.json'                
 test_file: '/data1/yx/suda/image-text/data/ALBEF/datas/data/coco_test.json'
 image_root: '/data1/yx/suda/image-text/data/images'
 
-batch_size_train: 32
-batch_size_test: 64
+batch_size_train: 192
+batch_size_test: 256
 k_test: 128
 warm_up: True
 

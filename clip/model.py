@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-
+from mgrc_torch import mgmc_sampling
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -364,13 +364,58 @@ class CLIP(nn.Module):
         image_features = image_features / image_features.norm(dim=1, keepdim=True)
         text_features = text_features / text_features.norm(dim=1, keepdim=True)
 
-        # cosine similarity as logits
         logit_scale = self.logit_scale.exp()
-        logits_per_image = logit_scale * image_features @ text_features.t()
-        logits_per_text = logits_per_image.t()
-
+        loss_std = clip_loss(image_features, text_features, logit_scale)
+        loss_img, loss_txt = mgmc_sampling(image_features, text_features, logit_scale, K=10, eta=0.6)
         # shape = [global_batch_size, global_batch_size]
-        return logits_per_image, logits_per_text
+        return loss_std, loss_img + loss_txt
+
+
+def clip_loss(image_features, text_features, logit_scale) -> torch.Tensor:
+    # cosine similarity as logits
+    similarity = logit_scale * image_features @ text_features.t()
+    caption_loss = contrastive_loss(similarity)
+    image_loss = contrastive_loss(similarity.T)
+    return (caption_loss + image_loss) / 2.0
+
+
+def get_samples(x_vector, y_vector, logit_scale, K, eta):
+    bias_vector = y_vector - x_vector
+    abs_bias_vector = torch.abs(bias_vector)
+    W_r = (abs_bias_vector - torch.min(abs_bias_vector, axis=1, keepdims=True).values) / \
+        (torch.max(abs_bias_vector, 1, keepdims=True).values -
+         torch.min(abs_bias_vector, 1, keepdims=True).values)
+    # initializing the set of samples
+    R = []
+    omega = torch.normal(0, W_r)
+    sample = x_vector + torch.multiply(omega, bias_vector)
+    loss = clip_loss(sample, y_vector, logit_scale)
+    R.append(sample)
+    for i in range(1, K):
+        chain = [item.unsqueeze(dim=1) for item in R[:i]]
+        average_omega = torch.mean(torch.cat(chain, dim=1), dim=1)
+        omega = eta * torch.normal(0, W_r) + (1.0 - eta) * \
+            torch.normal(average_omega, 1.0)
+        sample = x_vector + torch.multiply(omega, bias_vector)
+        loss += clip_loss(sample, y_vector, logit_scale)
+        R.append(sample)
+    return loss
+
+
+def mgmc_sampling(src_embedding, trg_embedding, logit_scale, K=20, eta=0.6):
+    # src_embedding: [batch_size, hidden_size]
+    # trg_embedding: [batch_size, hidden_size]
+    # default: K=20 and eta = 0.6
+    loss_src = get_samples(src_embedding, trg_embedding, logit_scale, K, eta) / K
+    loss_tgt = get_samples(trg_embedding, src_embedding, logit_scale, K, eta) / K
+    return loss_src, loss_tgt
+
+# contrastive loss function, adapted from
+# https://sachinruk.github.io/blog/pytorch/pytorch%20lightning/loss%20function/gpu/2021/03/07/CLIP.html
+
+
+def contrastive_loss(logits: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.cross_entropy(logits, torch.arange(len(logits), device=logits.device))
 
 
 def convert_weights(model: nn.Module):
