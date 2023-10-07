@@ -8,7 +8,13 @@ from .plateau_lr import PlateauLRScheduler
 
 
 def create_scheduler(args, optimizer):
+
     num_epochs = args.epochs
+    steps_per_epoch = args.steps_per_epoch
+    total_steps = steps_per_epoch * num_epochs 
+    # 定义要预热的step
+    warmup_step_ratio = args.warmup_epochs
+    warmup_steps = int(steps_per_epoch * warmup_step_ratio)
 
     if getattr(args, 'lr_noise', None) is not None:
         lr_noise = getattr(args, 'lr_noise')
@@ -25,12 +31,12 @@ def create_scheduler(args, optimizer):
     if args.sched == 'cosine':
         lr_scheduler = CosineLRScheduler(
             optimizer,
-            t_initial=num_epochs,
+            t_initial=total_steps,
             t_mul=getattr(args, 'lr_cycle_mul', 1.),
             lr_min=args.min_lr,
             decay_rate=args.decay_rate,
             warmup_lr_init=args.warmup_lr,
-            warmup_t=args.warmup_epochs,
+            warmup_t=warmup_steps,
             cycle_limit=getattr(args, 'lr_cycle_limit', 1),
             t_in_epochs=True,
             noise_range_t=noise_range,
@@ -42,11 +48,11 @@ def create_scheduler(args, optimizer):
     elif args.sched == 'tanh':
         lr_scheduler = TanhLRScheduler(
             optimizer,
-            t_initial=num_epochs,
+            t_initial=total_steps,
             t_mul=getattr(args, 'lr_cycle_mul', 1.),
             lr_min=args.min_lr,
             warmup_lr_init=args.warmup_lr,
-            warmup_t=args.warmup_epochs,
+            warmup_t=warmup_steps,
             cycle_limit=getattr(args, 'lr_cycle_limit', 1),
             t_in_epochs=True,
             noise_range_t=noise_range,

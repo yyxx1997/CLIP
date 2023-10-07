@@ -1,0 +1,7 @@
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+model_name='ViT-B-32'
+python -m torch.distributed.launch --nproc_per_node=4 --use_env Retrieval_entail_lr_split.py \
+    --config ./configs/Retrieval_coco_rebuild_entail_lr.yaml \
+    --output_dir output/Retrieval_coco_rebuild_entail_lr_split/${model_name} \
+    --checkpoint /data1/yx/suda/image-text/sotas/CLIP/output/common/${model_name}.pt \
+    --eval_before_train
