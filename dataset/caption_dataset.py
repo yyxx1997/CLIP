@@ -39,29 +39,21 @@ class re_eval_dataset(Dataset):
         self.image = []
         self.txt2img = {}
         self.img2txt = {}
-        filter_text = set()
-        txt_id = 0
+        cnt = 0 
         for img_id, ann in enumerate(self.ann):
             image_name=ann['image']
-            if image_name == "unk" or "":
-                for i, caption in enumerate(ann['caption']):
-                    if caption in filter_text:
-                        continue
-                    filter_text.add(caption)
+            self.image.append(image_name)
+            self.img2txt[img_id] = set()
+            for caption in ann['caption']:
+                if caption not in self.text:
+                    self.txt2img[cnt] = set()
+                    txt_id = cnt
                     self.text.append(caption)
-                    self.txt2img[txt_id] = -1
-                    txt_id += 1
-            else:
-                self.image.append(image_name)
-                self.img2txt[img_id] = []
-                for i, caption in enumerate(ann['caption']):
-                    if caption in filter_text:
-                        continue
-                    filter_text.add(caption)
-                    self.text.append(caption)
-                    self.img2txt[img_id].append(txt_id)
-                    self.txt2img[txt_id] = img_id
-                    txt_id += 1
+                    cnt += 1
+                else:
+                    txt_id = self.text.index(caption)
+                self.img2txt[img_id].add(txt_id)
+                self.txt2img[txt_id].add(img_id)  
                                     
     def __len__(self):
         return len(self.image)

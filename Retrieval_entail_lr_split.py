@@ -69,7 +69,7 @@ def train(model, data_loader, optimizer, epoch, device, scheduler, config):
         window_size=1, fmt='{value:.4f}'))
     metric_logger.add_meter('crush', utils.SmoothedValue(window_size=1, fmt='{value:.3f}'))
     header = 'Train Epoch: [{}]'.format(epoch)
-    print_freq = 10
+    print_freq = 50
     lr_decay = config['lowlr']
     total_step = epoch * len(data_loader)
 
@@ -88,16 +88,19 @@ def train(model, data_loader, optimizer, epoch, device, scheduler, config):
         metric_logger.update(lr=origin_lr)
 
         # 使用低学习率蕴含
-        extra_entail, crush = entail_check(image_names, extra_entail, data_loader)
-
-        image_input_entail = image_input
-        text_input_entail = clip.tokenize(extra_entail,truncate=True).to(device)
-        logits_per_image_entail, _ = model(image_input_entail,text_input_entail)
-        loss_itm_entail = clip_loss(logits_per_image_entail)
-        loss_itm_entail.backward()
-        modi_opt(optimizer, lr_decay)
-        optimizer.step()
-        optimizer.zero_grad()
+        if lr_decay >= 0.1:
+            extra_entail, crush = entail_check(image_names, extra_entail, data_loader)
+            image_input_entail = image_input
+            text_input_entail = clip.tokenize(extra_entail,truncate=True).to(device)
+            logits_per_image_entail, _ = model(image_input_entail,text_input_entail)
+            loss_itm_entail = clip_loss(logits_per_image_entail)
+            loss_itm_entail.backward()
+            modi_opt(optimizer, lr_decay)
+            optimizer.step()
+            optimizer.zero_grad()
+        else:
+            loss_itm_entail = 0
+            crush = 0
 
         metric_logger.update(loss_itm=loss_itm_origin+loss_itm_entail)
         metric_logger.update(crush=crush/len(image_names))
@@ -177,26 +180,19 @@ def evaluation(model, data_loader, device, config):
             "topks": [texts[txtid] for txtid in txt_ids]
             }
     # Images->Text
-    pres = np.zeros((scores_i2t.shape[0], 10))
     ranks = np.zeros(scores_i2t.shape[0])
-    golden_total=0
     for index, score in enumerate(scores_i2t):
         inds = np.argsort(score)[::-1]
         # Score
         rank = 1e20
         goldens = img2txt[index]
-        golden_total+=len(goldens)
         for i in goldens:
             tmp = np.where(inds == i)[0][0]
             if tmp < rank:
                 rank = tmp
         ranks[index] = rank
-        pres[index] = np.cumsum(np.in1d(inds[:10], goldens))
 
     # Compute metrics
-
-    pr5 = 100.0 * np.sum(pres[:, 4]) / golden_total
-    pr10 = 100.0 * np.sum(pres[:, 9]) / golden_total
 
     tr1 = 100.0 * len(np.where(ranks < 1)[0]) / len(ranks)
     tr5 = 100.0 * len(np.where(ranks < 5)[0]) / len(ranks)
@@ -204,13 +200,16 @@ def evaluation(model, data_loader, device, config):
 
     # Text->Images 
     ranks = np.zeros(scores_t2i.shape[0])
-    for index,score in enumerate(scores_t2i):
+    for index, score in enumerate(scores_t2i):
         inds = np.argsort(score)[::-1]
-        copes = np.where(inds == txt2img[index])[0]
-        if len(copes) == 0:
-            ranks[index] = 0
-        else:
-            ranks[index] = copes[0]
+        # Score
+        rank = 1e20
+        goldens = txt2img[index]
+        for i in goldens:
+            tmp = np.where(inds == i)[0][0]
+            if tmp < rank:
+                rank = tmp
+        ranks[index] = rank
 
     # Compute metrics
     ir1 = 100.0 * len(np.where(ranks < 1)[0]) / len(ranks)
@@ -218,7 +217,6 @@ def evaluation(model, data_loader, device, config):
     ir10 = 100.0 * len(np.where(ranks < 10)[0]) / len(ranks)        
 
     tr_mean = (tr1 + tr5 + tr10) / 3
-    pr_mean = (pr5 + pr10)/2
     ir_mean = (ir1 + ir5 + ir10) / 3
     r_mean = (tr_mean + ir_mean) / 2
 
@@ -226,9 +224,6 @@ def evaluation(model, data_loader, device, config):
                    'txt_r5': tr5,
                    'txt_r10': tr10,
                    'txt_r_mean': tr_mean,
-                   'txt_pr5': pr5,
-                   'txt_pr10': pr10,
-                   'txt_pr_mean': pr_mean,
                    'img_r1': ir1,
                    'img_r5': ir5,
                    'img_r10': ir10,
@@ -294,8 +289,8 @@ def main(config):
                             **{f'test_{k}': v for k, v in test_result.items()},                  
                             }
                 with open(os.path.join(config.output_dir, "log.txt"),"a") as f:
-                    f.write(json.dumps(config) + "\n") 
-                    f.write(json.dumps(log_stats) + "\n")     
+                    f.write(json.dumps(config, ensure_ascii=False, indent=4) + "\n") 
+                    f.write(json.dumps(log_stats, ensure_ascii=False, indent=4) + "\n")      
             return
     
     print("Start training")
@@ -321,8 +316,7 @@ def main(config):
                             'epoch': epoch,
                         }
             with open(os.path.join(config.output_dir, "log.txt"),"a") as f:
-                f.write(json.dumps(config) + "\n") 
-                f.write(json.dumps(log_stats) + "\n")   
+                f.write(json.dumps(log_stats, ensure_ascii=False, indent=4) + "\n")   
             
             save_obj = {
                     'state_dict': model_without_ddp.state_dict(),
@@ -337,7 +331,9 @@ def main(config):
                 best = val_result[best_standard]    
                 best_epoch = epoch
                 torch.save(save_obj, os.path.join(config.output_dir, 'checkpoint_best.pth'))
-                with open(os.path.join(args.output_dir, "best_top{}_result.json".format(config['k_test'])), "w") as f:
+                with open(os.path.join(args.output_dir, "top{}_result_{}_val.json".format(config['k_test'], best_epoch)), "w") as f:
+                    f.write(json.dumps(val_topk,ensure_ascii=False,indent=4))
+                with open(os.path.join(args.output_dir, "top{}_result_{}_test.json".format(config['k_test'], best_epoch)), "w") as f:
                     f.write(json.dumps(test_topk,ensure_ascii=False,indent=4))
 
         if utils.is_dist_avail_and_initialized():

@@ -1,8 +1,8 @@
-train_file:  '/data1/yx/suda/image-text/data/re_rebuild_data/coco_rebuild_train.json'
-val_file: '/data1/yx/suda/image-text/data/re_rebuild_data/coco_5k_test.json'                
-test_file: '/data1/yx/suda/image-text/data/annotations/format_annotation_re_coco.json'
+train_file:  '/data1/yx/suda/image-text/data/re_data/coco_train.json'
+val_file: '/data1/yx/suda/image-text/data/re_data/coco_5k_test.json'                
+test_file: '/data1/yx/suda/image-text/data/re_data/coco_5k_test_entailed.json'
 image_root: '/data1/yx/suda/image-text/data/images'
-entailments: '/data1/yx/suda/image-text/data/ALBEF/datas/data/coco_after_vete_2k_69.json'
+entailments: '/data1/yx/suda/image-text/data/ALBEF/datas/data/coco_after_llm.json'
 
 batch_size_train: 192
 batch_size_test: 256
