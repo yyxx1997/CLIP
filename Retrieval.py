@@ -20,7 +20,9 @@ import clip
 from tqdm import tqdm
 from contextlib import nullcontext
 import torch.optim as optim
-# from torch.utils.tensorboard import SummaryWriter
+from torch.cuda.amp import autocast, GradScaler
+from collections import defaultdict
+
 
 # contrastive loss function, adapted from
 # https://sachinruk.github.io/blog/pytorch/pytorch%20lightning/loss%20function/gpu/2021/03/07/CLIP.html
@@ -33,72 +35,156 @@ def clip_loss(similarity: torch.Tensor) -> torch.Tensor:
     image_loss = contrastive_loss(similarity.T)
     return (caption_loss + image_loss) / 2.0
 
-def train(model, data_loader, optimizer, epoch, warmup_steps, device, scheduler, config):
-    # train
-    model.train()  
-    metric_logger = utils.MetricLogger(delimiter="  ")
-    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.8f}'))
-    metric_logger.add_meter('loss_itm', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    header = 'Train Epoch: [{}]'.format(epoch)
-    print_freq = 50
-    step_size = 100
-    warmup_iterations = warmup_steps*step_size  
-    K = config.gradient_accumulation_steps
-    my_context = model.no_sync if config.local_rank != -1 and i % K != 0 else nullcontext
-
-    optimizer.zero_grad()
-    for i,(image, text, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        image_input = image.to(device,non_blocking=True)   
-        text_input = clip.tokenize(text,truncate=True).to(device)  
-
-        with my_context():
-            logits_per_image, _ = model(image_input,text_input)   
-            loss_itm = clip_loss(logits_per_image)               
-            loss_itm = loss_itm / K
-            loss_itm.backward()  # 积累梯度，不应用梯度改变
-        if (i+1) % K == 0:
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=20, norm_type=2)
-            optimizer.step()
-            optimizer.zero_grad()   
-        
-        metric_logger.update(loss_itm=loss_itm.item())
-        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-        if epoch==0 and i%step_size==0 and i<=warmup_iterations: 
-            scheduler.step(i//step_size)         
-        
-    # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger.global_avg())     
-    return {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()} 
-
-
-"""
-    def forward(self, image, text):
-        image_features = self.encode_image(image)
-        text_features = self.encode_text(text)
-
-        # normalized features
-        image_features = image_features / image_features.norm(dim=1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=1, keepdim=True)
-
-        # cosine similarity as logits
-        logit_scale = self.logit_scale.exp()
-        logits_per_image = logit_scale * image_features @ text_features.t()
-        logits_per_text = logits_per_image.t()
-
-        # shape = [global_batch_size, global_batch_size]
-        return logits_per_image, logits_per_text
-"""
-@torch.no_grad()
-def evaluation(model, data_loader, device, config):
-    # test
-    model.eval() 
+def train(model, model_without_ddp, train_loader, val_loader, test_loader, train_args):
     
-    metric_logger = utils.MetricLogger(delimiter="  ")
-    header = 'Evaluation:'    
-    print('Computing features for evaluation...')
-    print_freq = 50
-    start_time = time.time()  
+    max_epoch = config.schedular['epochs']
+    batch_size_train = config.batch_size_train
+    K = config.gradient_accumulation_steps
+    logging_steps = config.logging_steps
+    logging_strategy = config.logging_strategy
+    ckpt_output_path = config.ckpt_output_path
+    max_grad_norm = config.max_grad_norm
+    metrics = config.metrics
+    optimizer, lr_scheduler = train_args['optimizer'], train_args['lr_scheduler']
+    start_epoch = train_args.get('start_epoch', 1)
+    total_step = train_args.get('total_step', 0)
+    total_train_batch_size = batch_size_train * K * config.world_size
+
+    best_scores = defaultdict(lambda:None)
+    scaler = GradScaler()
+
+    metric_logger = utils.MetricLogger(logging=logger.info, delimiter=" - ")
+    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.8f}'))
+    metric_logger.add_meter('loss', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+
+    logger.info("Start training")
+    logger.info("***** Running training *****")
+    logger.info(f"  Num examples = {len(train_loader.dataset)}")
+    logger.info(f"  Num Epochs = {max_epoch}")
+    logger.info(f"  Instantaneous batch size per device = {batch_size_train}")
+    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}")
+    logger.info(f"  Gradient Accumulation steps = {K}")
+    start_time = time.time()
+
+    for epoch in range(start_epoch, max_epoch+1):
+        model.train()
+        logger.info(" -" * 20 + "Epochs of [{}/{}]".format(epoch, max_epoch) + " - " * 20)
+        header = 'Train Epoch: [{}/{}]'.format(epoch, max_epoch)
+        if config.distributed:
+            train_loader.sampler.set_epoch(epoch)
+
+        optimizer.zero_grad()
+        for i, (image, text, _) in enumerate(metric_logger.log_every(train_loader, header=header)):
+            image_input = image.to(device,non_blocking=True)   
+            text_input = clip.tokenize(text,truncate=True).to(device)  
+            
+            sync_context = model.no_sync if config.local_rank != -1 and (i + 1) % K != 0 else nullcontext
+            amp_context = autocast if config.use_amp else nullcontext
+            with sync_context():
+                with amp_context():
+                    logits_per_image, _ = model(image_input,text_input)   
+                    loss = clip_loss(logits_per_image)               
+                    loss = loss / K
+                scaler.scale(loss).backward()
+
+            if (i + 1) % K == 0:
+                # Best practice of AMP in DDP framework:
+                # https://pytorch.org/docs/stable/notes/amp_examples.html#functions-that-need-a-particular-dtype
+                # https://zhuanlan.zhihu.com/p/165152789
+                scaler.unscale_(optimizer)                
+                # https://pytorch.org/docs/stable/_modules/torch/nn/utils/clip_grad.html#clip_grad_norm_
+                # https://blog.csdn.net/zhaohongfei_358/article/details/122820992
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm, norm_type=2)
+                scaler.step(optimizer)
+                scaler.update()
+
+            total_step += 1
+            metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+            metric_logger.update(loss=loss.item()*K)
+            metric_logger.synchronize_between_processes()
+            need_tb_logs = metric_logger.latest_meter(prefix='train/')
+            
+            if (logging_strategy == "epoch" and i == len(train_loader) - 1) or (logging_strategy == "steps" and total_step % logging_steps == 0):
+                val_stats, val_prediction = evaluate(model_without_ddp, val_loader)
+                test_stats, test_prediction = evaluate(model_without_ddp, test_loader, "Test") if not config.only_dev else (val_stats, val_prediction)
+
+                save_evidence = []
+                for metric_name in metrics:
+                    if metric_name not in val_stats.keys():
+                        continue
+                    score = best_scores[metric_name]
+                    current_score = float(val_stats[metric_name])
+                    if score is None or current_score > score:
+                        save_evidence.append(metric_name)
+                        best_scores[metric_name] = current_score
+
+                log_stats = {**{f'val_{k}': v for k, v in val_stats.items()},
+                             **{f'test_{k}': v for k, v in test_stats.items()},
+                             'epoch': epoch,
+                             'step': i+1,
+                             'total_step': total_step
+                             }
+
+                need_tb_logs.update({
+                    **{f'val/{k}': v for k, v in val_stats.items()},
+                    **{f'test/{k}': v for k, v in test_stats.items()}
+                })
+
+                save_obj = {
+                    'model': model_without_ddp.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'lr_scheduler': lr_scheduler.state_dict(),
+                    'config': config,
+                    'epoch': epoch,
+                    'step': i+1,
+                    'total_step': total_step
+                }
+
+                if utils.is_main_process():
+                    ckpt_sub_path = os.path.join(ckpt_output_path, f"epoch_{epoch}-step_{i}")
+
+                    # logging statements
+                    utils.write_json(ckpt_sub_path, "log_stats", log_stats)
+
+                    # logging prediction
+                    utils.write_json(ckpt_sub_path, "val_prediction", val_prediction)
+                    utils.write_json(ckpt_sub_path, "test_prediction", test_prediction)
+
+                    # Saving normal checkpoints
+                    if save_evidence or config.save_every_checkpoint:
+                        torch.save(save_obj, os.path.join(ckpt_sub_path, 'checkpoint.pth'))
+
+                    # Saving checkpoints if they are distinct
+                    for metric_name in save_evidence:
+                        best_ckpt_path = os.path.join(ckpt_output_path, f"best_{metric_name}")
+                        utils.copy_whole_dir(ckpt_sub_path, best_ckpt_path)
+
+            tb_writer.add_dict_scalar(need_tb_logs, total_step)
+            lr_scheduler.step(total_step)
+
+        if utils.is_dist_avail_and_initialized():
+            dist.barrier()
+        torch.cuda.empty_cache()
+
+        # gather the stats from all processes
+        metric_logger.synchronize_between_processes()
+        logger.info("Averaged stats: {}".format(metric_logger.summary(mode="avg")))
+
+    total_time = time.time() - start_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    logger.info('***** Stopping training *****')
+    logger.info('Training time {}'.format(total_time_str))
+    tb_writer.close()
+
+
+@torch.no_grad()
+def evaluate(model, data_loader, special_name="Val"):
+    logger.info("- - - - - - - - - - - - - Evaluation- - - - - - - - - - - - - ")
+    # test
+    torch.cuda.empty_cache()
+    model.eval()
+    metric_logger = utils.MetricLogger(logging=logger.info, delimiter=" - ")
+    header = f'Evaluating {special_name} Set: '
 
     texts = data_loader.dataset.text
     images = data_loader.dataset.image
@@ -110,7 +196,7 @@ def evaluation(model, data_loader, device, config):
 
     num_text = len(texts)
     text_bs = config['batch_size_test']
-    for i in metric_logger.log_every(range(0, num_text, text_bs), print_freq, header + "Loading text and get text features..."):
+    for i in metric_logger.log_every(range(0, num_text, text_bs), header=header + "Loading text features..."):
         text = texts[i: min(num_text, i+text_bs)]
         text_input = clip.tokenize(text,truncate=True).to(device)
         text_output = model.encode_text(text_input)
@@ -118,7 +204,7 @@ def evaluation(model, data_loader, device, config):
 
     text_features = torch.cat(text_features, dim=0)
 
-    for image, img_id in metric_logger.log_every(data_loader, print_freq, header + "Loading image and get image features..."):
+    for image, img_id in metric_logger.log_every(data_loader, header=header + "Loading image features..."):
         image_input = image.to(device)
         image_output = model.encode_image(image_input)
         image_features.append(image_output.to('cpu'))
@@ -137,6 +223,7 @@ def evaluation(model, data_loader, device, config):
     logits_per_image = logit_scale * image_features @ text_features.t()
     logits_per_text = logits_per_image.t()
 
+    logger.info("- - - - - - - - - - - - - Calculating Results- - - - - - - - - - - - - ")
     result = {}
     topk_upper = config['k_test']
     scores_i2t = logits_per_image.cpu().numpy()
@@ -201,43 +288,39 @@ def evaluation(model, data_loader, device, config):
     ir_mean = (ir1 + ir5 + ir10) / 3
     r_mean = (tr_mean + ir_mean) / 2
 
-    eval_result = {'txt_r1': tr1,
-                   'txt_r5': tr5,
-                   'txt_r10': tr10,
-                   'txt_r_mean': tr_mean,
-                   'txt_pr5': pr5,
-                   'txt_pr10': pr10,
-                   'txt_pr_mean': pr_mean,
-                   'img_r1': ir1,
-                   'img_r5': ir5,
-                   'img_r10': ir10,
-                   'img_r_mean': ir_mean,
+    eval_result = {'i2t_r1': tr1,
+                   'i2t_r5': tr5,
+                   'i2t_r10': tr10,
+                   'i2t_r_mean': tr_mean,
+                   'i2t_pr5': pr5,
+                   'i2t_pr10': pr10,
+                   'i2t_pr_mean': pr_mean,
+                   't2i_r1': ir1,
+                   't2i_r5': ir5,
+                   't2i_r10': ir10,
+                   't2i_r_mean': ir_mean,
                    'r_mean': r_mean
                    }
-    print("eval_result is:\n",eval_result)
+    logger.info(eval_result)
     return eval_result, topk_result
 
-def main(config):
-     
-    device = torch.device(config.device)
-    # fix the seed for reproducibility
-    seed = config.seed + utils.get_rank()
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
+def main():
 
-    #### Model #### 
-    print("Creating model")  
+    #### Model ####
+    train_args = {}
+    logger.info("- - - - - - - - - - - - - Creating model- - - - - - - - - - - - - ")
     model, preprocess = clip.load(config.checkpoint, device=device, download_root=config.download_root)
     model = model.float()
     model = model.to(device)   
     model_without_ddp = model
     if config.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[config.gpu])
-        model_without_ddp = model.module  
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[config.gpu], find_unused_parameters=False)
+        model_without_ddp = model.module
 
-    #### Dataset #### 
-    print("Creating dataset")
+    #### Dataset ####
+    logger.info("- - - - - - - - - - - - - Creating dataset- - - - - - - - - - - - - ")
     train_dataset, val_dataset, test_dataset = create_dataset('re', preprocess, config)  
 
     if config.distributed:
@@ -252,86 +335,25 @@ def main(config):
                                                           num_workers=[4,4,4],
                                                           is_trains=[True, False, False], 
                                                           collate_fns=[None,None,None])   
-    
+    # next(iter(train_loader))
+
+    #### Training Controler ####
+    logger.info("- - - - - - - - - - - - - Loading TrainArgs- - - - - - - - - - - - - ")
     arg_opt = utils.AttrDict(config['optimizer'])
     optimizer = create_optimizer(arg_opt, model)
     arg_sche = utils.AttrDict(config['schedular'])
+    arg_sche.steps_per_epoch = len(train_loader)
     lr_scheduler, _ = create_scheduler(arg_sche, optimizer)  
-    # optimizer = optim.Adam(model.parameters(), lr=1e-7,weight_decay=0.2)
     
-    max_epoch = config['schedular']['epochs']
-    warmup_steps = config['schedular']['warmup_epochs']
-    best = 0
-    best_epoch = 0
-    best_standard = 'r_mean'
+    train_args['optimizer'] = optimizer
+    train_args['lr_scheduler'] = lr_scheduler
 
-    if config.eval_before_train or config.evaluate:
-        val_result,val_topk = evaluation(model_without_ddp, val_loader, device, config)
-        test_result,test_topk = evaluation(model_without_ddp, test_loader, device, config)
-        if config.evaluate:
-            if utils.is_main_process():             
-                log_stats = {**{f'val_{k}': v for k, v in val_result.items()},
-                            **{f'test_{k}': v for k, v in test_result.items()},                  
-                            }
-                with open(os.path.join(config.output_dir, "log.txt"),"a") as f:
-                    f.write(json.dumps(config) + "\n") 
-                    f.write(json.dumps(log_stats) + "\n")     
-            return
-    
-    print("Start training")
-    print("***** Running training *****")
-    print(f"  Num examples = {len(train_loader.dataset)}")
-    print(f"  Num Epochs = {max_epoch}")
-    print(f"  Instantaneous batch size per device = {config.batch_size_train}")
-    print(f"  Total train batch size (w. parallel, distributed & accumulation) = {config.total_train_batch_size}")
-    print(f"  Gradient Accumulation steps = {config.gradient_accumulation_steps}")
-    start_time = time.time()    
-    for epoch in range(0, max_epoch):
-        if config.distributed:
-            train_loader.sampler.set_epoch(epoch)
-        train_stats = train(model, train_loader, optimizer, epoch, warmup_steps, device, lr_scheduler, config)  
-            
-        val_result,val_topk = evaluation(model_without_ddp, val_loader, device, config)
-        test_result,test_topk = evaluation(model_without_ddp, test_loader, device, config)
-    
-        if utils.is_main_process():  
-            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                            **{f'val_{k}': v for k, v in val_result.items()},
-                            **{f'test_{k}': v for k, v in test_result.items()},                  
-                            'epoch': epoch,
-                        }
-            with open(os.path.join(config.output_dir, "log.txt"),"a") as f:
-                f.write(json.dumps(config) + "\n") 
-                f.write(json.dumps(log_stats) + "\n")   
-            
-            save_obj = {
-                    'state_dict': model_without_ddp.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'config': config,
-                    'epoch': epoch,
-                }
-            torch.save(save_obj, os.path.join(config.output_dir, 'checkpoint-{}.pth'.format(epoch))) 
+    if config.eval_before_train:
+        val_stats, _ = evaluate(model_without_ddp, val_loader)
 
-            if val_result[best_standard]>best:
-                best = val_result[best_standard]    
-                best_epoch = epoch
-                torch.save(save_obj, os.path.join(config.output_dir, 'checkpoint_best.pth'))
-                with open(os.path.join(args.output_dir, "best_top{}_result.json".format(config['k_test'])), "w") as f:
-                    f.write(json.dumps(test_topk,ensure_ascii=False,indent=4))
+    train(model, model_without_ddp, train_loader, val_loader,
+                  test_loader, train_args)             
 
-        lr_scheduler.step(epoch+warmup_steps+1)  
-        if utils.is_dist_avail_and_initialized():
-            dist.barrier()     
-        torch.cuda.empty_cache()
-
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str)) 
-
-    if utils.is_main_process():   
-        with open(os.path.join(config.output_dir, "log.txt"),"a") as f:
-            f.write("best epoch: %d"%best_epoch)               
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -341,16 +363,26 @@ def parse_args():
     parser.add_argument('--output_dir', default='./output/Retrieval_coco_debug')        
     parser.add_argument('--checkpoint', default="ViT-B/32")   
     parser.add_argument('--download_root', default="./output/common") 
-    parser.add_argument('--evaluate', action='store_true')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')    
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
     parser.add_argument('--distributed', default=True, type=bool)
     parser.add_argument('--dist_backend', default='nccl')
-    parser.add_argument('--gradient_accumulation_steps', default=1, type=int, help='gradient accumulation for increase batch virtually.')
-    parser.add_argument('--local_rank', default=-1, type=int, help='device number of current process.')
     parser.add_argument('--eval_before_train', action='store_true')
+    parser.add_argument('--only_dev', action='store_true')
+    parser.add_argument('--gradient_accumulation_steps', default=1, type=int,
+                        help='gradient accumulation for increase batch virtually.')
+    parser.add_argument('--max_grad_norm', default=5.0, type=float,
+                        help='clip gradient norm of an iterable of parameters')
+    parser.add_argument('--local_rank', default=-1, type=int,
+                        help='device number of current process.')
+    parser.add_argument('--logging_steps', default=500, type=int)
+    parser.add_argument('--logging_strategy', type=str, choices=['no','epoch','steps'], default='steps')
+    parser.add_argument('--logging_level', type=str, choices=['DEBUG','INFO','ERROR','WARNING'], default='INFO')
+    parser.add_argument('--save_every_checkpoint', action='store_true')
+    parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--use_amp', action='store_true')
     args = parser.parse_args()
     return args
             
@@ -358,16 +390,23 @@ if __name__ == '__main__':
 
     # set configuration for training or evaluating
     args = parse_args()
-    config = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
-    utils.init_distributed_mode(args)
-    args.total_train_batch_size = config['batch_size_train'] * args.gradient_accumulation_steps * args.world_size
-    
-    config=utils.AttrDict(config)
-    args=utils.AttrDict(args.__dict__)
+    config = utils.read_yaml(args.config)
+    config = utils.AttrDict(config)
+    args = utils.AttrDict(args.__dict__)
+    # The parameters passed in from the command line take precedence
     config.update(args)
 
-    print("all global configuration is here:\n",config)
-    if utils.is_main_process():
-        Path(config.output_dir).mkdir(parents=True, exist_ok=True)   
-        yaml.dump(dict(config), open(os.path.join(config.output_dir, 'global_config.yaml'), 'w')) 
-    main(config)
+    # Determine global parameters and settings
+    utils.init_distributed_mode(config)
+    device = torch.device(config.device)
+    # fix the seed for reproducibility
+    utils.setup_seed(config.seed)
+    # record them in file.
+    current_branch, git_info = utils.get_git_info(os.path.dirname(os.path.abspath(__file__)))
+    config.current_branch = current_branch
+    logger, tb_writer = utils.create_logger(config)
+
+    logger.info(f"Here is all global configuration:\n {str(config)}")
+    logger.info(f"Here is all git repo infomation:\n {git_info}")
+
+    main()

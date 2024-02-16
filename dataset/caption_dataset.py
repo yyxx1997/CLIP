@@ -43,17 +43,17 @@ class re_eval_dataset(Dataset):
         for img_id, ann in enumerate(self.ann):
             image_name=ann['image']
             self.image.append(image_name)
-            self.img2txt[img_id] = set()
+            self.img2txt[img_id] = []
             for caption in ann['caption']:
                 if caption not in self.text:
-                    self.txt2img[cnt] = set()
+                    self.txt2img[cnt] = []
                     txt_id = cnt
                     self.text.append(caption)
                     cnt += 1
                 else:
                     txt_id = self.text.index(caption)
-                self.img2txt[img_id].add(txt_id)
-                self.txt2img[txt_id].add(img_id)  
+                self.img2txt[img_id].append(txt_id)
+                self.txt2img[txt_id].append(img_id)  
                                     
     def __len__(self):
         return len(self.image)
