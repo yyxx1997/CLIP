@@ -3,14 +3,13 @@ val_file: '../Data/re_data/coco_val.json'
 test_file: '../Data/re_data/coco_test.json'
 image_root: '../Data/images'
 
-batch_size_train: 32
-batch_size_test: 64
+batch_size_train: 128
+batch_size_test: 256
 k_test: 128
 warm_up: True
 
 optimizer: {opt: adamW, lr: 1e-5, weight_decay: 0.02}
 schedular: {sched: cosine, lr: 1e-5, epochs: 5, min_lr: 1e-7, decay_rate: 1, warmup_lr: 1e-6, warmup_epochs: 1, cooldown_epochs: 0}
-# '/data1/yx/suda/image-text/sotas/CLIP/output/common/re_train_samlltest.json'
 
 # Evaluation Metrics
 metrics: ['i2t_r1', 't2i_r1', 'r_mean']

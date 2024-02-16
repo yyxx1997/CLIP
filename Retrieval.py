@@ -132,9 +132,6 @@ def train(model, model_without_ddp, train_loader, val_loader, test_loader, train
 
                 save_obj = {
                     'model': model_without_ddp.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'config': config,
                     'epoch': epoch,
                     'step': i+1,
                     'total_step': total_step
@@ -378,10 +375,9 @@ def parse_args():
     parser.add_argument('--local_rank', default=-1, type=int,
                         help='device number of current process.')
     parser.add_argument('--logging_steps', default=500, type=int)
-    parser.add_argument('--logging_strategy', type=str, choices=['no','epoch','steps'], default='steps')
+    parser.add_argument('--logging_strategy', type=str, choices=['no','epoch','steps'], default='epoch')
     parser.add_argument('--logging_level', type=str, choices=['DEBUG','INFO','ERROR','WARNING'], default='INFO')
     parser.add_argument('--save_every_checkpoint', action='store_true')
-    parser.add_argument('--resume', action='store_true')
     parser.add_argument('--use_amp', action='store_true')
     args = parser.parse_args()
     return args

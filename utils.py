@@ -77,20 +77,18 @@ def create_logger(config):
         logger -> a handler that can perform log operations;
         # sub_output_path -> final output directory depend on timestamp.
 
-    goal:
+    structure:
     --------
-        /root -> name according to settings
-
-            /sub_root -> name according to timing
+        /root -> name according to settings + git branch name + timestamp
             
-                /checkpoints -> big files
-                    ...
+            /checkpoints -> big files
+                ...
 
-                tensorboard.logs
+            tensorboard.logs
 
-                example.log
+            logging file
 
-                global_config.yaml
+            global_config.yaml
             ...
     """
     output_path = os.path.join(config.output_dir, config.current_branch, time.strftime('%Y-%m-%d-%H-%M'))
