@@ -178,7 +178,6 @@ def train(model, model_without_ddp, train_loader, val_loader, test_loader, train
 def evaluate(model, data_loader, special_name="Val"):
     logger.info("- - - - - - - - - - - - - Evaluation- - - - - - - - - - - - - ")
     # test
-    torch.cuda.empty_cache()
     model.eval()
     metric_logger = utils.MetricLogger(logging=logger.info, delimiter=" - ")
     header = f'Evaluating {special_name} Set: '
@@ -346,10 +345,13 @@ def main():
     train_args['lr_scheduler'] = lr_scheduler
 
     if config.eval_before_train:
-        val_stats, _ = evaluate(model_without_ddp, val_loader)
+        logger.info("- - - - - - - - - - - - - Evaluate Before Train- - - - - - - - - - - - - ")
+        evaluate(model_without_ddp, val_loader)
+        evaluate(model_without_ddp, test_loader, special_name="Test")
 
     train(model, model_without_ddp, train_loader, val_loader,
-                  test_loader, train_args)             
+                  test_loader, train_args)    
+    logger.info("- - - - - - - - - - - - - End of All- - - - - - - - - - - - - ")         
 
 
 def parse_args():
