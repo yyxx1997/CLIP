@@ -11,6 +11,11 @@ def create_dataset(dataset, preprocess, config):
         val_dataset = re_eval_dataset(config['val_file'], preprocess, config['image_root'])  
         test_dataset = re_eval_dataset(config['test_file'], preprocess, config['image_root'])                
         return train_dataset, val_dataset, test_dataset  
+    elif dataset == 'mixgen':
+        train_dataset = re_train_dataset_mixgen(config['train_file'], preprocess, config['image_root'], config.mix_rate, config.mix_lam)
+        val_dataset = re_eval_dataset(config['val_file'], preprocess, config['image_root'])  
+        test_dataset = re_eval_dataset(config['test_file'], preprocess, config['image_root'])                
+        return train_dataset, val_dataset, test_dataset 
 
 
 def create_sampler(datasets, shuffles, num_tasks, global_rank):

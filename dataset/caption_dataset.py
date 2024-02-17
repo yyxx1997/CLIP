@@ -1,16 +1,38 @@
 import json
 import os
-import random
 from PIL import Image
+import torch
 from torch.utils.data import Dataset
+import numpy as np
 
 
-class re_train_dataset(Dataset):
-    def __init__(self, ann_file, transform, image_root, max_words=30):        
+def mixgen(image, text, num, lam=0.5):
+    # default MixGen
+    for i in range(num):
+        # image mixup
+        image[i,:] = lam * image[i,:] + (1 - lam) * image[i+num,:]
+        # text concat
+        text[i] = text[i] + " " + text[i+num]
+    return image, text
+
+
+def mixgen_batch(image, text, num, lam=0.5):
+    batch_size = image.size()[0]
+    index = np.random.permutation(batch_size)
+    for i in range(batch_size):
+        # image mixup
+        image[i,:] = lam * image[i,:] + (1 - lam) * image[index[i],:]
+        # text concat
+        text[i] = text[i] + " " + text[index[i]]
+    return image, text
+
+class re_train_dataset_mixgen(Dataset):
+    def __init__(self, ann_file, transform, image_root, mix_rate=0.25, mix_lam=0.5):        
         self.ann = json.load(open(ann_file,'r'))
         self.transform = transform
         self.image_root = image_root
-        self.max_words = max_words
+        self.mix_rate = mix_rate
+        self.mix_lam = mix_lam
         
     def __len__(self):
         return len(self.ann)
@@ -23,17 +45,44 @@ class re_train_dataset(Dataset):
         image = Image.open(image_path).convert('RGB')   
         image = self.transform(image)
         caption = ann['caption']
-        extra_info = (ann['image'],caption)
-        return image, caption, extra_info
+        return image, caption
     
-    
+    def collate_fn(self, batchs):
+        images = []
+        texts = []
+        for image, text in batchs:
+            images.append(image)
+            texts.append(text)
+        images = torch.stack(images)
+        N = int(self.mix_rate * len(batchs))
+        mixgen(images, texts, N, self.mix_lam)
+        return images, texts
 
-class re_eval_dataset(Dataset):
-    def __init__(self, ann_file, transform, image_root, max_words=30):        
+class re_train_dataset(Dataset):
+    def __init__(self, ann_file, transform, image_root):        
         self.ann = json.load(open(ann_file,'r'))
         self.transform = transform
         self.image_root = image_root
-        self.max_words = max_words 
+        
+    def __len__(self):
+        return len(self.ann)
+    
+    def __getitem__(self, index):    
+        
+        ann = self.ann[index]
+        
+        image_path = os.path.join(self.image_root,ann['image'])        
+        image = Image.open(image_path).convert('RGB')   
+        image = self.transform(image)
+        caption = ann['caption']
+        return image, caption
+
+
+class re_eval_dataset(Dataset):
+    def __init__(self, ann_file, transform, image_root):        
+        self.ann = json.load(open(ann_file,'r'))
+        self.transform = transform
+        self.image_root = image_root
         
         self.text = []
         self.image = []
@@ -66,105 +115,3 @@ class re_eval_dataset(Dataset):
         image = self.transform(image)  
 
         return image, index
-      
-class re_random_dataset(Dataset):
-    def __init__(self, ann_file, transform, image_root, max_words=30):        
-        self.ann = json.load(open(ann_file,'r'))
-        self.transform = transform
-        self.image_root = image_root
-        self.max_words = max_words
-        
-    def __len__(self):
-        return len(self.ann)
-    
-    def __getitem__(self, index):    
-        
-        ann = random.sample(self.ann,1)[0]
-        
-        image_path = os.path.join(self.image_root,ann['image'])        
-        image = Image.open(image_path).convert('RGB')   
-        image = self.transform(image)
-        caption = ann['caption']
-        return image, caption
-            
-class re_entail_lr_train_dataset(Dataset):
-    def __init__(self, ann_file, transform, image_root, max_words=30):        
-        self.ann = json.load(open(ann_file,'r'))
-        self.transform = transform
-        self.image_root = image_root
-        self.max_words = max_words
-        self.img_ids = {}   
-        
-        n = 0
-        for ann in self.ann:
-            img_id = ann['image_id']
-            if img_id not in self.img_ids.keys():
-                self.img_ids[img_id] = n
-                n += 1    
-        
-    def __len__(self):
-        return len(self.ann)
-    
-    def __getitem__(self, index):    
-        
-        ann = self.ann[index]
-        
-        image_path = os.path.join(self.image_root,ann['image'])        
-        image = Image.open(image_path).convert('RGB')   
-        image = self.transform(image)
-        
-        caption = ann['caption']
-        gold = ann['gold'] 
-
-        return image, caption, gold
-    
-class re_entail_lr_split_train_dataset(Dataset):
-    def __init__(self, ann_file, entailments, transform, image_root, max_words=30):        
-        self.ann = json.load(open(ann_file,'r'))
-        self.entailments = json.load(open(entailments,'r'))
-        self.img2txt_entail = {}
-        self.goldens = {}
-        for image_path, dct in self.entailments.items():
-            goldens = dct['goldens']
-            self.goldens[image_path] = goldens
-            entailments = dct['entailments']
-            if entailments:
-                self.img2txt_entail[image_path] = entailments
-        self.transform = transform
-        self.image_root = image_root
-        self.max_words = max_words
-        self.img_ids = {}   
-        
-        n = 0
-        for ann in self.ann:
-            img_id = ann['image_id']
-            if img_id not in self.img_ids.keys():
-                self.img_ids[img_id] = n
-                n += 1    
-        
-    def __len__(self):
-        return len(self.ann)
-    
-    def __getitem__(self, index):    
-        
-        ann = self.ann[index]
-        image_name = ann['image']
-        image_path = os.path.join(self.image_root,image_name)        
-        image = Image.open(image_path).convert('RGB')   
-        image = self.transform(image)
-        
-        caption = ann['caption']
-        if image_name in self.img2txt_entail.keys():
-            entail_pools = self.img2txt_entail[image_name]
-            random_entail = random.sample(entail_pools,1)[0]
-        elif image_name in self.goldens.keys():
-            random_entail = random.sample(self.goldens[image_name],1)[0]
-        else:
-            random_entail = caption
-
-        return image, caption, random_entail, image_name
-
-    def random(self):
-        ann = random.sample(self.ann,1)[0]
-        caption = ann['caption']
-        return caption

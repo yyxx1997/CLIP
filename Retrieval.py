@@ -74,7 +74,7 @@ def train(model, model_without_ddp, train_loader, val_loader, test_loader, train
             train_loader.sampler.set_epoch(epoch)
 
         optimizer.zero_grad()
-        for i, (image, text, _) in enumerate(metric_logger.log_every(train_loader, header=header)):
+        for i, (image, text) in enumerate(metric_logger.log_every(train_loader, header=header)):
             image_input = image.to(device,non_blocking=True)   
             text_input = clip.tokenize(text,truncate=True).to(device)  
             
@@ -317,7 +317,7 @@ def main():
 
     #### Dataset ####
     logger.info("- - - - - - - - - - - - - Creating dataset- - - - - - - - - - - - - ")
-    train_dataset, val_dataset, test_dataset = create_dataset('re', preprocess, config)  
+    train_dataset, val_dataset, test_dataset = create_dataset(config.dataset, preprocess, config)  
 
     if config.distributed:
         num_tasks = utils.get_world_size()
@@ -330,7 +330,7 @@ def main():
                                                           batch_size=[config['batch_size_train']]+[config['batch_size_test']]*2,
                                                           num_workers=[4,4,4],
                                                           is_trains=[True, False, False], 
-                                                          collate_fns=[None,None,None])   
+                                                          collate_fns=[train_dataset.collate_fn, None, None])   
     # next(iter(train_loader))
 
     #### Training Controler ####
@@ -358,6 +358,9 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="necessarily parameters for run this code."
     )     
+    parser.add_argument('--mix_rate', default=0.25, type=float,help='Mixup generation portion.')
+    parser.add_argument('--mix_lam', default=0.5, type=float,help='Mixup generation lambda.')
+    parser.add_argument('--dataset', default="mixgen")   
     parser.add_argument('--config', default='./configs/Retrieval_coco.yaml')
     parser.add_argument('--output_dir', default='./output/Retrieval_coco_debug')        
     parser.add_argument('--checkpoint', default="ViT-B/32")   
