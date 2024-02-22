@@ -4,18 +4,16 @@ from torch.utils.data import DataLoader
 from dataset.caption_dataset import *
 
 
-def create_dataset(dataset, preprocess, config): 
+def create_dataset(mode, preprocess, config): 
     
-    if dataset=='re':          
+    if mode == 're':          
         train_dataset = re_train_dataset(config['train_file'], preprocess, config['image_root'])
-        val_dataset = re_eval_dataset(config['val_file'], preprocess, config['image_root'])  
-        test_dataset = re_eval_dataset(config['test_file'], preprocess, config['image_root'])                
-        return train_dataset, val_dataset, test_dataset  
-    elif dataset == 'mixgen':
-        train_dataset = re_train_dataset_mixgen(config['train_file'], preprocess, config['image_root'], config.mix_rate, config.mix_lam)
-        val_dataset = re_eval_dataset(config['val_file'], preprocess, config['image_root'])  
-        test_dataset = re_eval_dataset(config['test_file'], preprocess, config['image_root'])                
-        return train_dataset, val_dataset, test_dataset 
+    else:
+        train_dataset = re_train_dataset_mixgen(config['train_file'], preprocess, config['image_root'], config.mix_rate, config.mix_lam, mode)
+
+    val_dataset = re_eval_dataset(config['val_file'], preprocess, config['image_root'])  
+    test_dataset = re_eval_dataset(config['test_file'], preprocess, config['image_root'])                
+    return train_dataset, val_dataset, test_dataset 
 
 
 def create_sampler(datasets, shuffles, num_tasks, global_rank):

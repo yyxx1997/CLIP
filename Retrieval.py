@@ -317,7 +317,7 @@ def main():
 
     #### Dataset ####
     logger.info("- - - - - - - - - - - - - Creating dataset- - - - - - - - - - - - - ")
-    train_dataset, val_dataset, test_dataset = create_dataset(config.dataset, preprocess, config)  
+    train_dataset, val_dataset, test_dataset = create_dataset(config.mode, preprocess, config)  
 
     if config.distributed:
         num_tasks = utils.get_world_size()
@@ -360,7 +360,7 @@ def parse_args():
     )     
     parser.add_argument('--mix_rate', default=0.25, type=float,help='Mixup generation portion.')
     parser.add_argument('--mix_lam', default=0.5, type=float,help='Mixup generation lambda.')
-    parser.add_argument('--dataset', default="mixgen")   
+    parser.add_argument('--mode', type=str, choices=['re','mixgen','mixgen_batch','mixgen_random'], default='re', help="Selection of mixgen mode.")   
     parser.add_argument('--config', default='./configs/Retrieval_coco.yaml')
     parser.add_argument('--output_dir', default='./output/Retrieval_coco_debug')        
     parser.add_argument('--checkpoint', default="ViT-B/32")   
@@ -407,7 +407,7 @@ if __name__ == '__main__':
     config.current_branch = current_branch
     logger, tb_writer = utils.create_logger(config)
 
-    logger.info(f"Here is all global configuration:\n {str(config)}")
-    logger.info(f"Here is all git repo infomation:\n {git_info}")
+    logger.info(f"Here is all global configuration: {str(config)}")
+    logger.info(f"Here is all git repo infomation: {git_info}")
 
     main()
