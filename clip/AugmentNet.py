@@ -147,10 +147,12 @@ class AugNet(nn.Module):
 
         # cosine similarity as logits
         logit_scale = self.logit_scale.exp()
+        contrast_acc= -1
 
         if self.mode == 'task':
-            image_features_aug = self.semantic_encoder(image_features)
-            text_features_aug = self.semantic_encoder(text_features)
+            # 复现casnmt基于插值的最终增强向量使用
+            image_features_aug = image_features * 0.5 + self.semantic_encoder(image_features) * 0.5
+            text_features_aug = text_features * 0.5 + self.semantic_encoder(text_features) * 0.5
 
             image_features = image_features / image_features.norm(dim=1, keepdim=True)
             text_features = text_features / text_features.norm(dim=1, keepdim=True)
@@ -158,22 +160,20 @@ class AugNet(nn.Module):
             text_features_aug = text_features_aug / text_features_aug.norm(dim=1, keepdim=True)
 
             loss = clip_loss(image_features, text_features, logit_scale)
-            loss_aug = (clip_loss(image_features, text_features_aug, logit_scale) + clip_loss(image_features_aug, text_features, logit_scale)) / 2
-
-            return loss + loss_aug * 0.1
+            loss_aug = (clip_loss(image_features_aug, text_features, logit_scale) + clip_loss(image_features, text_features_aug, logit_scale)) / 2
+            return loss + loss_aug, contrast_acc
         elif self.mode == 'aug':
+            # 复现casnmt ctl loss，在augnet训练阶段不加入额外损失
             image_features_aug = self.semantic_encoder(image_features)
             text_features_aug = self.semantic_encoder(text_features)
 
-            image_features = image_features / image_features.norm(dim=1, keepdim=True)
-            text_features = text_features / text_features.norm(dim=1, keepdim=True)
             image_features_aug = image_features_aug / image_features_aug.norm(dim=1, keepdim=True)
             text_features_aug = text_features_aug / text_features_aug.norm(dim=1, keepdim=True)
 
-            loss_aug = (clip_loss(image_features, text_features_aug, logit_scale) + clip_loss(image_features_aug, text_features, logit_scale)) / 2
-            loss_ctl = clip_loss(image_features_aug, text_features_aug, logit_scale)
-            return loss_aug + loss_ctl
+            loss_ctl, contrast_acc = get_ctl_loss(image_features_aug.unsqueeze(1), text_features_aug.unsqueeze(1), temperature=0.5)
+            return loss_ctl, contrast_acc
         elif self.mode == 'union':
+            # augnet与原网络协同训练，学习率较小。额外引入增强数据和源标签的损失，串联俩任务
             # normalized features
             image_features_aug = self.semantic_encoder(image_features)
             text_features_aug = self.semantic_encoder(text_features)
@@ -185,8 +185,46 @@ class AugNet(nn.Module):
             
             loss = clip_loss(image_features, text_features, logit_scale)
             loss_aug = (clip_loss(image_features, text_features_aug, logit_scale) + clip_loss(image_features_aug, text_features, logit_scale)) / 2
-            loss_ctl = clip_loss(image_features_aug, text_features_aug, logit_scale)
-            return loss + loss_aug * 0.1 + loss_ctl * 0.05
+            loss_ctl, contrast_acc = get_ctl_loss(image_features_aug.unsqueeze(1), text_features_aug.unsqueeze(1), temperature=0.5)
+            return loss + (loss_aug + loss_ctl) * 0.25, contrast_acc
+
+import torch
+import torch.nn.functional as F
+
+def get_ctl_loss(src_embedding, trg_embedding, dynamic_coefficient=1.0, temperature=1.0):
+    # src_embedding: [batch_size, 1, hidden_size]
+    # trg_embedding: [batch_size, 1, hidden_size]
+    batch_size = src_embedding.size(0)
+
+    def get_ctl_logits(query, keys):
+        expand_query = query.repeat(1, batch_size, 1)
+        expand_keys = keys.permute(1, 0, 2).repeat(batch_size, 1, 1)
+
+        d_pos = torch.sqrt(torch.sum((query - keys)**2, dim=-1))  # [batch_size, 1]
+        d_pos = d_pos.repeat(1, batch_size)  # [batch_size, batch_size]
+        d_neg = torch.sqrt(torch.sum((expand_query - expand_keys)**2, dim=-1))  # [batch_size, batch_size]
+
+        lambda_coefficient = (d_pos / d_neg)**dynamic_coefficient
+        hardness_masks = torch.gt(d_neg, d_pos).float()
+
+        hard_keys = (expand_query + lambda_coefficient.unsqueeze(2) * (expand_keys - expand_query)) * hardness_masks.unsqueeze(2) + \
+                    expand_keys * (1.0 - hardness_masks.unsqueeze(2))
+
+        logits = torch.bmm(query, hard_keys.transpose(1, 2)) / temperature  # [batch_size, 1, batch_size]
+        return logits
+
+    logits_src_trg = get_ctl_logits(src_embedding, trg_embedding)
+    logits_trg_src = get_ctl_logits(trg_embedding, src_embedding) + \
+                    torch.unsqueeze(torch.tril(torch.ones(batch_size, batch_size).to(src_embedding.device) * -1e9), dim=1)
+    logits = torch.cat([logits_src_trg, logits_trg_src], dim=2)  # [batch_size, 1, 2*batch_size]
+
+    labels = torch.unsqueeze(torch.arange(batch_size, dtype=torch.long), dim=1).to(src_embedding.device)
+
+    loss = F.cross_entropy(logits.view(batch_size, 2*batch_size), labels.view(-1), reduction='mean')
+
+    contrast_acc = torch.mean((torch.argmax(logits, dim=2) == labels.view(-1)).float()).item()
+
+    return loss, contrast_acc
 
 
 if __name__ == "__main__":

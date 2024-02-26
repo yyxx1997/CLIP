@@ -46,6 +46,7 @@ def train(model, model_without_ddp, train_loader, val_loader, test_loader, train
     metric_logger = utils.MetricLogger(logging=logger.info, delimiter=" - ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.8f}'))
     metric_logger.add_meter('loss', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    metric_logger.add_meter('contrast_acc', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
 
     logger.info("Start training")
     logger.info("***** Running training *****")
@@ -72,7 +73,7 @@ def train(model, model_without_ddp, train_loader, val_loader, test_loader, train
             amp_context = autocast if config.use_amp else nullcontext
             with sync_context():
                 with amp_context():
-                    loss = model(image_input,text_input)               
+                    loss, contrast_acc = model(image_input,text_input)               
                     loss = loss / K
                 scaler.scale(loss).backward()
 
@@ -90,6 +91,7 @@ def train(model, model_without_ddp, train_loader, val_loader, test_loader, train
             total_step += 1
             metric_logger.update(lr=optimizer.param_groups[0]["lr"])
             metric_logger.update(loss=loss.item()*K)
+            metric_logger.update(contrast_acc=contrast_acc)
             metric_logger.synchronize_between_processes()
             need_tb_logs = metric_logger.latest_meter(prefix='train/')
             
@@ -301,14 +303,13 @@ def main():
         logger.info("No loading requirement.")
         model = clip_model
     else:
-        model = AugNet(clip_model, 6, mode=config.mode)
+        model = AugNet(clip_model, 3, mode=config.mode)
         if config.mode == 'aug':
-            checkpoint = torch.load(config.task_model_ckpt)
-            msg = model.clip.load_state_dict(checkpoint['model'])
+            logger.info("No loading requirement.")
         elif config.mode == 'union' or config.mode == 'task':
             checkpoint = torch.load(config.aug_model_ckpt)
             msg = model.semantic_encoder.load_state_dict(checkpoint['model'])
-        logger.info(msg)
+            logger.info(f"Loading {config.aug_model_ckpt}: " + msg)
         
     model = model.to(device)   
     model_without_ddp = model
@@ -354,13 +355,14 @@ def main():
 
     train(model, model_without_ddp, train_loader, val_loader,
                   test_loader, train_args)    
-    if config.mode == "aug":
+    if "aug" in config.mode:
         save_obj = {
             'model': model_without_ddp.semantic_encoder.state_dict(),
         }
-
         if utils.is_main_process():
-            torch.save(save_obj, os.path.join("../Models", f'{config.mode}.pth'))
+            augnet_path = config.aug_model_ckpt
+            torch.save(save_obj, augnet_path)
+            logger.info(f'Saving augnet params to {augnet_path}')
 
     logger.info("- - - - - - - - - - - - - End of All- - - - - - - - - - - - - ")         
 
@@ -370,7 +372,6 @@ def parse_args():
         description="necessarily parameters for run this code."
     )   
     parser.add_argument('--aug_model_ckpt', default="../Models/augnet.pth")   
-    parser.add_argument('--task_model_ckpt', default="../Output/CLIP/Retrieval_coco/DataAug/re/casnmt/2024-02-26-13-26/checkpoints/best_r_mean/checkpoint.pth") 
     parser.add_argument('--mode', type=str, choices=['aug','task','union', 're'], default='task')
     parser.add_argument('--config', default='./configs/Retrieval_coco.yaml')
     parser.add_argument('--output_dir', default='./output/Retrieval_coco_debug')        
