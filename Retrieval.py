@@ -22,18 +22,8 @@ from contextlib import nullcontext
 import torch.optim as optim
 from torch.cuda.amp import autocast, GradScaler
 from collections import defaultdict
+from clip.AugmentNet import AugNet
 
-
-# contrastive loss function, adapted from
-# https://sachinruk.github.io/blog/pytorch/pytorch%20lightning/loss%20function/gpu/2021/03/07/CLIP.html
-def contrastive_loss(logits: torch.Tensor) -> torch.Tensor:
-    return torch.nn.functional.cross_entropy(logits, torch.arange(len(logits), device=logits.device))
-
-
-def clip_loss(similarity: torch.Tensor) -> torch.Tensor:
-    caption_loss = contrastive_loss(similarity)
-    image_loss = contrastive_loss(similarity.T)
-    return (caption_loss + image_loss) / 2.0
 
 def train(model, model_without_ddp, train_loader, val_loader, test_loader, train_args):
     
@@ -82,8 +72,7 @@ def train(model, model_without_ddp, train_loader, val_loader, test_loader, train
             amp_context = autocast if config.use_amp else nullcontext
             with sync_context():
                 with amp_context():
-                    logits_per_image, _ = model(image_input,text_input)   
-                    loss = clip_loss(logits_per_image)               
+                    loss = model(image_input,text_input)               
                     loss = loss / K
                 scaler.scale(loss).backward()
 
@@ -305,8 +294,22 @@ def main():
     #### Model ####
     train_args = {}
     logger.info("- - - - - - - - - - - - - Creating model- - - - - - - - - - - - - ")
-    model, preprocess = clip.load(config.checkpoint, device=device, download_root=config.download_root)
-    model = model.float()
+    clip_model, preprocess = clip.load(config.checkpoint, device="cpu", download_root=config.download_root)
+    clip_model = clip_model.float()
+    
+    if config.mode == "re":
+        logger.info("No loading requirement.")
+        model = clip_model
+    else:
+        model = AugNet(clip_model, 6, mode=config.mode)
+        if config.mode == 'aug':
+            checkpoint = torch.load(config.task_model_ckpt)
+            msg = model.clip.load_state_dict(checkpoint['model'])
+        elif config.mode == 'union' or config.mode == 'task':
+            checkpoint = torch.load(config.aug_model_ckpt)
+            msg = model.semantic_encoder.load_state_dict(checkpoint['model'])
+        logger.info(msg)
+        
     model = model.to(device)   
     model_without_ddp = model
     if config.distributed:
@@ -351,13 +354,24 @@ def main():
 
     train(model, model_without_ddp, train_loader, val_loader,
                   test_loader, train_args)    
+    if config.mode == "aug":
+        save_obj = {
+            'model': model_without_ddp.semantic_encoder.state_dict(),
+        }
+
+        if utils.is_main_process():
+            torch.save(save_obj, os.path.join("../Models", f'{config.mode}.pth'))
+
     logger.info("- - - - - - - - - - - - - End of All- - - - - - - - - - - - - ")         
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="necessarily parameters for run this code."
-    )     
+    )   
+    parser.add_argument('--aug_model_ckpt', default="../Models/augnet.pth")   
+    parser.add_argument('--task_model_ckpt', default="../Output/CLIP/Retrieval_coco/DataAug/re/casnmt/2024-02-26-13-26/checkpoints/best_r_mean/checkpoint.pth") 
+    parser.add_argument('--mode', type=str, choices=['aug','task','union', 're'], default='task')
     parser.add_argument('--config', default='./configs/Retrieval_coco.yaml')
     parser.add_argument('--output_dir', default='./output/Retrieval_coco_debug')        
     parser.add_argument('--checkpoint', default="ViT-B/32")   

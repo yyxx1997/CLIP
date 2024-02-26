@@ -13,7 +13,7 @@ def create_scheduler(args, optimizer):
     steps_per_epoch = args.steps_per_epoch
     total_steps = steps_per_epoch * num_epochs 
     # 定义要预热的step
-    warmup_step_ratio = args.warmup_epochs
+    warmup_step_ratio = args.warmup_epochs if args.warm_up else 0
     warmup_steps = int(steps_per_epoch * warmup_step_ratio)
 
     if getattr(args, 'lr_noise', None) is not None:
