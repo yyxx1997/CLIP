@@ -23,17 +23,17 @@ class ResidualBlock(nn.Module):
         return F.relu(x)
 
 class StackedMLP(nn.Module):
-    def __init__(self, input_size, output_size, n_layers=6):
+    def __init__(self, input_size, hidden_size, output_size, n_layers=1):
         super(StackedMLP, self).__init__()
 
         self.mlp_layers = nn.ModuleList()
         prev_size = input_size
-        hidden_size = input_size * 2
 
-        # Create and stack MLP layers with residual connections
+        # Create and stack MLP layers
         for _ in range(n_layers):
-            residual_block = ResidualBlock(prev_size, hidden_size)
-            self.mlp_layers.append(residual_block)
+            layer = nn.Linear(prev_size, hidden_size)
+            self.mlp_layers.append(layer)
+            prev_size = hidden_size
 
         # Output layer
         self.output_layer = nn.Linear(prev_size, output_size)
@@ -55,13 +55,16 @@ class StackedMLP(nn.Module):
     def forward(self, x):
         # Forward pass through each MLP layer
         for layer in self.mlp_layers:
-            x = layer(x)
+            x = F.relu(layer(x))
 
         # Output layer
         x = self.output_layer(x)
         return x
 
-def get_samples(x_vector, y_vector, logit_scale, K, eta):
+def mgrc_sampling(x_vector, y_vector, K, eta):
+    # src_embedding: [batch_size, hidden_size]
+    # trg_embedding: [batch_size, hidden_size]
+    # default: K=20 and eta = 0.6
     bias_vector = y_vector - x_vector
     abs_bias_vector = torch.abs(bias_vector)
     W_r = (abs_bias_vector - torch.min(abs_bias_vector, axis=1, keepdims=True).values) / \
@@ -71,7 +74,6 @@ def get_samples(x_vector, y_vector, logit_scale, K, eta):
     R = []
     omega = torch.normal(0, W_r)
     sample = x_vector + torch.multiply(omega, bias_vector)
-    loss = clip_loss(sample, y_vector, logit_scale)
     R.append(sample)
     for i in range(1, K):
         chain = [item.unsqueeze(dim=1) for item in R[:i]]
@@ -79,23 +81,12 @@ def get_samples(x_vector, y_vector, logit_scale, K, eta):
         omega = eta * torch.normal(0, W_r) + (1.0 - eta) * \
             torch.normal(average_omega, 1.0)
         sample = x_vector + torch.multiply(omega, bias_vector)
-        loss += clip_loss(sample, y_vector, logit_scale)
         R.append(sample)
-    return loss
+    return R
 
-
-def mgmc_sampling(src_embedding, trg_embedding, logit_scale, K=20, eta=0.6):
-    # src_embedding: [batch_size, hidden_size]
-    # trg_embedding: [batch_size, hidden_size]
-    # default: K=20 and eta = 0.6
-    loss_src = get_samples(src_embedding, trg_embedding, logit_scale, K, eta) / K
-    loss_tgt = get_samples(trg_embedding, src_embedding, logit_scale, K, eta) / K
-    return loss_src, loss_tgt
 
 # contrastive loss function, adapted from
 # https://sachinruk.github.io/blog/pytorch/pytorch%20lightning/loss%20function/gpu/2021/03/07/CLIP.html
-
-
 def contrastive_loss(logits: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.cross_entropy(logits, torch.arange(len(logits), device=logits.device))
 
@@ -113,16 +104,16 @@ def frozen(model):
 
 class AugNet(nn.Module):
 
-    def __init__(self, clip, n_layers, mode='task'):
+    def __init__(self, clip, K=20, eta=0.6, alpha=0.1, temp=0.5):
         super().__init__()
         self.clip = clip
         embed_dim = self.clip.text_projection.shape[1]
-        self.semantic_encoder = StackedMLP(embed_dim, embed_dim, n_layers)
-        self.mode = mode
-        if self.mode == 'aug':
-            frozen(self.clip)
-        elif self.mode == 'task':
-            frozen(self.semantic_encoder)
+        self.semantic_encoder_image = nn.Parameter(torch.rand(embed_dim, embed_dim))
+        self.semantic_encoder_text = nn.Parameter(torch.rand(embed_dim, embed_dim))
+        self.mgrc_K = K
+        self.mgrc_eta = eta
+        self.alpha = alpha
+        self.temp = temp
 
     def encode_image(self, image):
         return self.clip.encode_image(image)
@@ -133,60 +124,40 @@ class AugNet(nn.Module):
     @property
     def logit_scale(self):
         return self.clip.logit_scale
-    
-    def infer(self, image, text):
-        return self.clip(image, text)
 
-    def forward(self, image, text, is_train=True):
-        if not is_train:
-            return self.infer(image, text)
-        
-        # mode in 'aug', 'task', 'union', 'infer'
+    def forward(self, image, text):
         image_features = self.encode_image(image)
         text_features = self.encode_text(text)
 
         # cosine similarity as logits
         logit_scale = self.logit_scale.exp()
-        contrast_acc= -1
 
-        if self.mode == 'task':
-            # 复现casnmt基于插值的最终增强向量使用
-            image_features_aug = image_features * 0.5 + self.semantic_encoder(image_features) * 0.5
-            text_features_aug = text_features * 0.5 + self.semantic_encoder(text_features) * 0.5
+        # augnet与原网络协同训练，学习率较小。额外引入增强数据和源标签的损失，串联俩任务
+        # normalized features
+        image_features_aug = image_features @ self.semantic_encoder_image
+        text_features_aug = text_features @ self.semantic_encoder_text
 
-            image_features = image_features / image_features.norm(dim=1, keepdim=True)
-            text_features = text_features / text_features.norm(dim=1, keepdim=True)
-            image_features_aug = image_features_aug / image_features_aug.norm(dim=1, keepdim=True)
-            text_features_aug = text_features_aug / text_features_aug.norm(dim=1, keepdim=True)
-
-            loss = clip_loss(image_features, text_features, logit_scale)
-            loss_aug = (clip_loss(image_features_aug, text_features, logit_scale) + clip_loss(image_features, text_features_aug, logit_scale)) / 2
-            return loss + loss_aug, contrast_acc
-        elif self.mode == 'aug':
-            # 复现casnmt ctl loss，在augnet训练阶段不加入额外损失
-            image_features_aug = self.semantic_encoder(image_features)
-            text_features_aug = self.semantic_encoder(text_features)
-
-            image_features_aug = image_features_aug / image_features_aug.norm(dim=1, keepdim=True)
-            text_features_aug = text_features_aug / text_features_aug.norm(dim=1, keepdim=True)
-
-            loss_ctl, contrast_acc = get_ctl_loss(image_features_aug.unsqueeze(1), text_features_aug.unsqueeze(1), temperature=0.5)
-            return loss_ctl, contrast_acc
-        elif self.mode == 'union':
-            # augnet与原网络协同训练，学习率较小。额外引入增强数据和源标签的损失，串联俩任务
-            # normalized features
-            image_features_aug = self.semantic_encoder(image_features)
-            text_features_aug = self.semantic_encoder(text_features)
-
-            image_features = image_features / image_features.norm(dim=1, keepdim=True)
-            text_features = text_features / text_features.norm(dim=1, keepdim=True)
-            image_features_aug = image_features_aug / image_features_aug.norm(dim=1, keepdim=True)
-            text_features_aug = text_features_aug / text_features_aug.norm(dim=1, keepdim=True)
-            
-            loss = clip_loss(image_features, text_features, logit_scale)
-            loss_aug = (clip_loss(image_features, text_features_aug, logit_scale) + clip_loss(image_features_aug, text_features, logit_scale)) / 2
-            loss_ctl, contrast_acc = get_ctl_loss(image_features_aug.unsqueeze(1), text_features_aug.unsqueeze(1), temperature=0.5)
-            return loss + (loss_aug + loss_ctl) * 0.25, contrast_acc
+        image_features = image_features / image_features.norm(dim=1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=1, keepdim=True)
+        image_features_aug = image_features_aug / image_features_aug.norm(dim=1, keepdim=True)
+        text_features_aug = text_features_aug / text_features_aug.norm(dim=1, keepdim=True)
+        
+        loss = clip_loss(image_features, text_features, logit_scale)
+        loss_mgrc = (self.mgrc_loss(image_features_aug, text_features_aug) + \
+                        self.mgrc_loss(text_features_aug, image_features_aug)) / 2.0
+        loss_ctl, contrast_acc = get_ctl_loss(image_features_aug.unsqueeze(1), text_features_aug.unsqueeze(1), temperature=self.temp)
+        return loss + (loss_mgrc + loss_ctl) * self.alpha, contrast_acc
+    
+    def mgrc_loss(self, src_aug, tgt_aug):
+        # src_embedding: [batch_size, hidden_size]
+        # tgt_embedding: [batch_size, hidden_size]
+        samples = mgrc_sampling(src_aug, tgt_aug, K=self.mgrc_K, eta=self.mgrc_eta)
+        loss_mgrc = 0
+        for src_sample in samples:
+            # mixup_embedding = self.gate_net(torch.cat((src_emb, src_sample), dim=-1))
+            loss_mgrc += clip_loss(src_sample, tgt_aug, self.logit_scale)
+        loss_mgrc = loss_mgrc / self.mgrc_K
+        return loss_mgrc
 
 import torch
 import torch.nn.functional as F
@@ -214,16 +185,15 @@ def get_ctl_loss(src_embedding, trg_embedding, dynamic_coefficient=1.0, temperat
         return logits
 
     logits_src_trg = get_ctl_logits(src_embedding, trg_embedding)
-    logits_trg_src = get_ctl_logits(trg_embedding, src_embedding) + \
-                    torch.unsqueeze(torch.tril(torch.ones(batch_size, batch_size).to(src_embedding.device) * -1e9), dim=1)
-    logits = torch.cat([logits_src_trg, logits_trg_src], dim=2)  # [batch_size, 1, 2*batch_size]
+    logits_trg_src = get_ctl_logits(trg_embedding, src_embedding)
 
     labels = torch.unsqueeze(torch.arange(batch_size, dtype=torch.long), dim=1).to(src_embedding.device)
 
-    loss = F.cross_entropy(logits.view(batch_size, 2*batch_size), labels.view(-1), reduction='mean')
+    loss_st = F.cross_entropy(logits_src_trg.view(batch_size, -1), labels.view(-1), reduction='mean')
+    loss_ts = F.cross_entropy(logits_trg_src.view(batch_size, -1), labels.view(-1), reduction='mean')
 
-    contrast_acc = torch.mean((torch.argmax(logits, dim=2) == labels.view(-1)).float()).item()
-
+    contrast_acc = torch.mean((torch.argmax(logits_src_trg.view(batch_size, -1), dim=1) == labels.view(-1)).float()).item()
+    loss = (loss_st + loss_ts) / 2
     return loss, contrast_acc
 
 

@@ -303,13 +303,7 @@ def main():
         logger.info("No loading requirement.")
         model = clip_model
     else:
-        model = AugNet(clip_model, 3, mode=config.mode)
-        if config.mode == 'aug':
-            logger.info("No loading requirement.")
-        elif config.mode == 'union' or config.mode == 'task':
-            checkpoint = torch.load(config.aug_model_ckpt)
-            msg = model.semantic_encoder.load_state_dict(checkpoint['model'])
-            logger.info(f"Loading {config.aug_model_ckpt}: " + msg)
+        model = AugNet(clip_model, K=config.mgrc_K, eta=config.mgrc_eta, alpha=config.alpha, temp=config.temp)
         
     model = model.to(device)   
     model_without_ddp = model
@@ -355,14 +349,6 @@ def main():
 
     train(model, model_without_ddp, train_loader, val_loader,
                   test_loader, train_args)    
-    if "aug" in config.mode:
-        save_obj = {
-            'model': model_without_ddp.semantic_encoder.state_dict(),
-        }
-        if utils.is_main_process():
-            augnet_path = config.aug_model_ckpt
-            torch.save(save_obj, augnet_path)
-            logger.info(f'Saving augnet params to {augnet_path}')
 
     logger.info("- - - - - - - - - - - - - End of All- - - - - - - - - - - - - ")         
 
@@ -370,9 +356,12 @@ def main():
 def parse_args():
     parser = argparse.ArgumentParser(
         description="necessarily parameters for run this code."
-    )   
-    parser.add_argument('--aug_model_ckpt', default="../Models/augnet.pth")   
-    parser.add_argument('--mode', type=str, choices=['aug','task','union', 're'], default='task')
+    )    
+    parser.add_argument('--mgrc_K', default=20, type=int)
+    parser.add_argument('--mgrc_eta', default=0.6, type=float)
+    parser.add_argument('--alpha', default=0.1, type=float)
+    parser.add_argument('--temp', default=0.5, type=float)
+    parser.add_argument('--mode', type=str, choices=['union', 're'], default='union')
     parser.add_argument('--config', default='./configs/Retrieval_coco.yaml')
     parser.add_argument('--output_dir', default='./output/Retrieval_coco_debug')        
     parser.add_argument('--checkpoint', default="ViT-B/32")   
